@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-EMBEDDINGS_PATH = os.path.join(os.path.dirname(__file__), "embeddings.json")
+EMBEDDINGS_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "embeddings.json"))
 
 def load_embeddings():
     if os.path.exists(EMBEDDINGS_PATH):
