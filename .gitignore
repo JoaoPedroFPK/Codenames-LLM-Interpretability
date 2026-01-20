@@ -3,3 +3,5 @@ output/
 venv/
 .env
 utils/embeddings.json
+utils/players.json
+

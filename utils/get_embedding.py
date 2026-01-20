@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 EMBEDDINGS_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "embeddings.json"))
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 def load_embeddings():
     if os.path.exists(EMBEDDINGS_PATH):
@@ -33,7 +34,6 @@ def get_embedding(text):
     embeddings = load_embeddings()
     if text_key in embeddings:
         return embeddings[text_key]
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     response = client.embeddings.create(input=text_key, model="text-embedding-3-small")
     embedding = response.data[0].embedding
     embeddings[text_key] = embedding
