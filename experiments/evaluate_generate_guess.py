@@ -1,9 +1,12 @@
 from tarfile import data_filter
 from utils.get_embedding import get_embedding
+from utils.get_player_vector import get_player_vector
 from sklearn.metrics.pairwise import cosine_similarity
 import pandas as pd
 from datetime import datetime
 import os
+import numpy as np
+
 
 
 def generate_guess_and_evaluate():
@@ -20,16 +23,23 @@ def generate_guess_and_evaluate():
 
     for index, row in df.iterrows():
         remaining = row['remaining']
+
         hint = row['hint']
         player_guess = row['output']
 
         hint_embedding = get_embedding(hint)
+
+        # Remaining words are normalized by the board. The user does not see each word individually, but rather the board as a whole.
         remaining_embeddings = [get_embedding(word) for word in remaining]
+        mean_remaining_embedding = np.mean(remaining_embeddings, axis=0)
+        std_remaining_embedding = np.std(remaining_embeddings, axis=0) 
+
 
         target_scores = []
         for word, embedding in zip(remaining, remaining_embeddings):
             target_score = cosine_similarity(hint_embedding, embedding)
-            target_scores.append(target_score)
+            normalized_target_score = (target_score - mean_remaining_embedding) / (std_remaining_embedding + 1e-6)
+            target_scores.append(normalized_target_score)
 
         max_score = max(target_scores)
         ai_guess = remaining[target_scores.index(max_score)]
@@ -58,21 +68,5 @@ def generate_guess_and_evaluate():
     print(f"Alignment rate: {results_df['is_aligned'].mean():.2%}")
     
     return results_df
-
-
-
-
-def generate_guess_and_evaluate_with_context():
-    """
-    This method will calculate the embeddings for each word and the hint. 
-    It will then calculate cosine similarity between the embedding of the hint and the embeddings of the words.
-    Then, the word with the highest target score will be considered as the AI Guess. 
-    We will then evaluate if the AI guess corresponds to the player's guess. 
-    However, this time the AI will also use as context the demographics, the political leaning, the event, the demographics only, the personality only, and all the information from the Giver.
-    We will measure whether providing the context approximates the embedding of the player's guess.
-    """
-    pass
-
-
 
 
