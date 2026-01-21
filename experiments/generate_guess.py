@@ -201,15 +201,23 @@ def predict_ai_guess(remaining_words, normalized_scores):
 def evaluate_alignment(ai_guess, player_guess):
     """
     Evaluate whether the AI's guess aligns with the human player's guess.
-    
+    If player_guess contains a comma, split and pick only the first word (top-1 approach).
+
     Args:
         ai_guess (str): The word predicted by the AI
         player_guess (str): The word chosen by the human player
-        
+
     Returns:
         bool: True if AI and human guesses match, False otherwise
     """
-    return ai_guess == player_guess
+    if isinstance(player_guess, str) and "," in player_guess:
+        # Split by comma, remove whitespace, and pick the first guess
+        guesses = [g.strip() for g in player_guess.split(",")]
+        top_player_guess = guesses[0] if guesses else player_guess
+    else:
+        top_player_guess = player_guess
+
+    return ai_guess == top_player_guess
 
 
 def create_result_object(hint, remaining, player_guess, ai_guess, target_scores, normalized_scores, alignment):
