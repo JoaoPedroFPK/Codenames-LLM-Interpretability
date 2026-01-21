@@ -3,7 +3,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.get_embedding import get_embedding, get_embeddings_batch, preload_embeddings
-from utils.get_player_vector import get_player_vector
+from utils.get_player_vector import get_player_vector, preload_player_vectors
 from sklearn.metrics.pairwise import cosine_similarity
 import pandas as pd
 from datetime import datetime
@@ -102,13 +102,17 @@ def calculate_embeddings(hint, remaining_words):
     return hint_embedding, remaining_embeddings
 
 
-def compute_cosine_similarities(hint_embedding, word_embeddings):
+def compute_cosine_similarities(hint_embedding, word_embeddings, player_embedding=None, alpha=0.3):
     """
     Compute cosine similarity between hint embedding and each word embedding.
+    If player_embedding is provided, uses score fusion: 
+    score = (1 - alpha) * cos_sim(hint, word) + alpha * cos_sim(player, word)
     
     Args:
         hint_embedding (list): Embedding vector for the hint
         word_embeddings (list): List of embedding vectors for words
+        player_embedding (list, optional): Embedding vector for the player
+        alpha (float): Weight for player embedding in score fusion (default: 0.3)
         
     Returns:
         list: Cosine similarity scores for each word
@@ -119,7 +123,16 @@ def compute_cosine_similarities(hint_embedding, word_embeddings):
         # Reshape to 2D arrays for cosine_similarity
         hint_2d = np.array(hint_embedding).reshape(1, -1)
         embedding_2d = np.array(embedding).reshape(1, -1)
-        target_score = cosine_similarity(hint_2d, embedding_2d)[0][0]
+        hint_score = cosine_similarity(hint_2d, embedding_2d)[0][0]
+        
+        if player_embedding is not None:
+            # Apply score fusion with player embedding
+            player_2d = np.array(player_embedding).reshape(1, -1)
+            player_score = cosine_similarity(player_2d, embedding_2d)[0][0]
+            target_score = (1 - alpha) * hint_score + alpha * player_score
+        else:
+            target_score = hint_score
+            
         target_scores.append(target_score)
     
     return target_scores
@@ -143,12 +156,14 @@ def normalize_scores(scores):
     return normalized_scores
 
 
-def process_single_row(row_data: Dict[str, Any]) -> Dict[str, Any]:
+def process_single_row(row_data: Dict[str, Any], use_player_context: bool = False, alpha: float = 0.3) -> Dict[str, Any]:
     """
     Process a single row of data to compute AI guess and alignment.
 
     Args:
         row_data: Dictionary containing row data
+        use_player_context: Whether to include player embedding in score calculation
+        alpha: Weight for player embedding in score fusion (only used if use_player_context=True)
 
     Returns:
         dict: Result object with all evaluation metrics
@@ -156,12 +171,21 @@ def process_single_row(row_data: Dict[str, Any]) -> Dict[str, Any]:
     remaining = row_data['remaining']
     hint = row_data['hint']
     player_guess = row_data['player_guess']
+    giver_features = row_data.get('giver_features')
 
     # Calculate embeddings for hint and remaining words (should be cached)
     hint_embedding, remaining_embeddings = calculate_embeddings(hint, remaining)
 
-    # Compute cosine similarities between hint and each word
-    target_scores = compute_cosine_similarities(hint_embedding, remaining_embeddings)
+    # Get player embedding if use_player_context is True
+    player_embedding = None
+    if use_player_context and giver_features:
+        player_embedding = get_player_vector(giver_features)
+        # Normalize player embedding to same dimension as hint/word embeddings
+        min_dim = len(hint_embedding)
+        player_embedding = player_embedding[:min_dim]
+
+    # Compute cosine similarities between hint and each word (with optional player context)
+    target_scores = compute_cosine_similarities(hint_embedding, remaining_embeddings, player_embedding, alpha)
 
     # Normalize scores relative to other scores for this hint
     normalized_scores = normalize_scores(target_scores)
@@ -327,7 +351,7 @@ def extract_player_features(df, prefix: str) -> dict:
 
 
 
-def generate_guess_experiment(batch_size=50, max_rows=1000, resume_from_batch=None, max_workers=None):
+def generate_guess_experiment(batch_size=50, max_rows=1000, resume_from_batch=None, max_workers=None, use_player_context=False, alpha=0.3):
     """
     Main function to generate AI guesses and evaluate alignment with human players.
 
@@ -339,6 +363,8 @@ def generate_guess_experiment(batch_size=50, max_rows=1000, resume_from_batch=No
         max_rows (int): Maximum number of rows to process from the dataset
         resume_from_batch (int, optional): Batch number to resume from (None to start fresh)
         max_workers (int, optional): Maximum number of worker processes (defaults to CPU count)
+        use_player_context (bool): Whether to use player embedding in score calculation (default: False)
+        alpha (float): Weight for player embedding in score fusion (default: 0.3, only used if use_player_context=True)
 
     Returns:
         pandas.DataFrame: DataFrame containing all evaluation results with alignment metrics
@@ -348,6 +374,13 @@ def generate_guess_experiment(batch_size=50, max_rows=1000, resume_from_batch=No
 
     # Preload all embeddings first
     preload_all_embeddings(df, max_rows, batch_size=100)
+
+    # Preload player embeddings if using player context
+    if use_player_context:
+        print("Extracting and preloading giver player embeddings...")
+        giver_features_list = extract_player_features(df.head(max_rows) if max_rows else df, prefix="giver")
+        preload_player_vectors(giver_features_list, batch_size=100)
+        print("Player embeddings preloaded successfully")
 
     # Set up parallel processing
     if max_workers is None:
@@ -367,6 +400,8 @@ def generate_guess_experiment(batch_size=50, max_rows=1000, resume_from_batch=No
     rows_to_process = df.iloc[start_row:max_rows]
 
     print(f"Processing rows {start_row} to {total_rows} using {max_workers} workers")
+    if use_player_context:
+        print(f"Using player context with alpha={alpha}")
 
     # Process rows in parallel batches
     processed_rows = start_row
@@ -375,12 +410,19 @@ def generate_guess_experiment(batch_size=50, max_rows=1000, resume_from_batch=No
         # Submit all tasks
         future_to_index = {}
         for index, row in rows_to_process.iterrows():
+            # Extract giver features if using player context
+            giver_features = None
+            if use_player_context:
+                giver_features_list = extract_player_features(pd.DataFrame([row]), prefix="giver")
+                giver_features = giver_features_list[0] if giver_features_list else None
+            
             row_data = {
                 'remaining': ast.literal_eval(row['remaining']),
                 'hint': row['hint'],
-                'player_guess': row['output']
+                'player_guess': row['output'],
+                'giver_features': giver_features
             }
-            future = executor.submit(process_single_row, row_data)
+            future = executor.submit(process_single_row, row_data, use_player_context, alpha)
             future_to_index[future] = index
 
         # Collect results as they complete
@@ -420,4 +462,5 @@ def generate_guess_experiment(batch_size=50, max_rows=1000, resume_from_batch=No
 
 if __name__ == "__main__":
     # You can adjust batch_size and max_rows as needed
-    generate_guess_experiment(batch_size=50, max_rows=1000)
+    # Set use_player_context=True to include player personality in scoring
+    generate_guess_experiment(batch_size=50, max_rows=1000, use_player_context=False, alpha=0.3)
