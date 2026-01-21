@@ -2,54 +2,103 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.get_embedding import get_embedding
+from utils.get_embedding import get_embedding, get_embeddings_batch, preload_embeddings
 from utils.get_player_vector import get_player_vector
 from sklearn.metrics.pairwise import cosine_similarity
 import pandas as pd
 from datetime import datetime
 import numpy as np
 import ast
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Dict, List, Any, Optional
+import multiprocessing
 
 
 def load_and_setup_data():
     """
     Load the preprocessed generate_guess data and setup output directory structure.
-    
+
     Returns:
         tuple: (DataFrame, str, str) containing the loaded data, base output path, and final output path
     """
     df = pd.read_csv('data/preprocessed/generate_guess.csv')
-    
+
     # Setup output directory and base filename
     os.makedirs('data/experiments', exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     base_output_path = f'data/experiments/generate_guess_evaluation_{timestamp}'
     final_output_path = f'{base_output_path}.csv'
-    
+
     return df, base_output_path, final_output_path
+
+
+def collect_unique_texts(df: pd.DataFrame, max_rows: Optional[int] = None) -> set:
+    """
+    Collect all unique words and hints from the dataset.
+
+    Args:
+        df: DataFrame containing the dataset
+        max_rows: Maximum number of rows to process (None for all rows)
+
+    Returns:
+        set: Set of unique texts (words and hints)
+    """
+    unique_texts = set()
+
+    rows_to_process = df.head(max_rows) if max_rows else df
+
+    for _, row in rows_to_process.iterrows():
+        # Add hint
+        unique_texts.add(str(row['hint']).strip())
+
+        # Add all remaining words
+        remaining = ast.literal_eval(row['remaining'])
+        for word in remaining:
+            unique_texts.add(str(word).strip())
+
+    return unique_texts
+
+
+def preload_all_embeddings(df: pd.DataFrame, max_rows: Optional[int] = None, batch_size: int = 100) -> None:
+    """
+    Preload embeddings for all unique words and hints in the dataset.
+
+    Args:
+        df: DataFrame containing the dataset
+        max_rows: Maximum number of rows to process (None for all rows)
+        batch_size: Batch size for embedding computation
+    """
+    print("Collecting unique texts from dataset...")
+    unique_texts = collect_unique_texts(df, max_rows)
+    print(f"Found {len(unique_texts)} unique texts to embed")
+
+    print("Preloading embeddings in batches...")
+    preload_embeddings(list(unique_texts), batch_size=batch_size)
+    print("Embeddings preloaded successfully")
 
 
 def calculate_embeddings(hint, remaining_words):
     """
     Calculate embeddings for the hint and all remaining words on the board.
-    
+    Assumes embeddings have been preloaded into cache.
+
     Args:
         hint (str): The hint given to players
         remaining_words (list): List of remaining words on the board
-        
+
     Returns:
         tuple: (hint_embedding, remaining_embeddings) where embeddings are normalized to same dimension
     """
-    hint_embedding = get_embedding(hint)
-    remaining_embeddings = [get_embedding(word) for word in remaining_words]
-    
+    hint_embedding = get_embedding(hint)  # Will use cached embedding
+    remaining_embeddings = [get_embedding(word) for word in remaining_words]  # All cached
+
     # Ensure all embeddings have the same dimension by truncating to minimum length
     all_embeddings = [hint_embedding] + remaining_embeddings
     min_dim = min(len(emb) for emb in all_embeddings)
-    
+
     hint_embedding = hint_embedding[:min_dim]
     remaining_embeddings = [emb[:min_dim] for emb in remaining_embeddings]
-    
+
     return hint_embedding, remaining_embeddings
 
 
@@ -79,10 +128,10 @@ def compute_cosine_similarities(hint_embedding, word_embeddings):
 def normalize_scores(scores):
     """
     Normalize target scores using z-score normalization relative to other scores for the same hint.
-    
+
     Args:
         scores (list): Raw cosine similarity scores
-        
+
     Returns:
         numpy.ndarray: Normalized scores
     """
@@ -90,8 +139,46 @@ def normalize_scores(scores):
     mean_score = np.mean(scores_array)
     std_score = np.std(scores_array)
     normalized_scores = (scores_array - mean_score) / (std_score + 1e-6)
-    
+
     return normalized_scores
+
+
+def process_single_row(row_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Process a single row of data to compute AI guess and alignment.
+
+    Args:
+        row_data: Dictionary containing row data
+
+    Returns:
+        dict: Result object with all evaluation metrics
+    """
+    remaining = row_data['remaining']
+    hint = row_data['hint']
+    player_guess = row_data['player_guess']
+
+    # Calculate embeddings for hint and remaining words (should be cached)
+    hint_embedding, remaining_embeddings = calculate_embeddings(hint, remaining)
+
+    # Compute cosine similarities between hint and each word
+    target_scores = compute_cosine_similarities(hint_embedding, remaining_embeddings)
+
+    # Normalize scores relative to other scores for this hint
+    normalized_scores = normalize_scores(target_scores)
+
+    # Predict AI's best guess
+    ai_guess, max_score = predict_ai_guess(remaining, normalized_scores)
+
+    # Evaluate alignment between AI and human guess
+    alignment = evaluate_alignment(ai_guess, player_guess)
+
+    # Create comprehensive result object
+    result_obj = create_result_object(
+        hint, remaining, player_guess, ai_guess,
+        target_scores, normalized_scores, alignment
+    )
+
+    return result_obj
 
 
 def predict_ai_guess(remaining_words, normalized_scores):
@@ -200,96 +287,129 @@ def save_final_results(all_results, output_path):
     
     return results_df
 
+def extract_player_features(df, prefix: str) -> dict:
+    """
+    Extracts player-specific features from a pandas DataFrame using a provided column prefix.
+    
+    Args:
+        df (pandas.DataFrame): The DataFrame containing player data with column names prefixed (e.g., "giver.age").
+        prefix (str): The prefix in the column names corresponding to the player ("giver" or "guesser").
+    
+    Returns:
+        list of dict: A list of dictionaries where each dictionary represents the selected features for a player in a row.
+                      The dictionary keys are feature names (e.g., "age", "care"), and values are the corresponding values from the DataFrame.
+    """
+    PLAYER_FEATURES = [
+        "age",
+        "care",
+        "fairness",
+        "loyalty",
+        "authority",
+        "sanctity",
+        "political",
+        "conscientiousness",
+        "extraversion",
+        "neuroticism",
+        "openness",
+        "agreeableness",
+    ]
+    cols = {f"{prefix}.{feat}": feat for feat in PLAYER_FEATURES}
+    return df[list(cols.keys())].rename(columns=cols).to_dict(orient="records")
 
-def generate_guess_and_evaluate(batch_size=50, max_rows=1000, resume_from_batch=None):
+
+
+
+def generate_guess_experiment(batch_size=50, max_rows=1000, resume_from_batch=None, max_workers=None):
     """
     Main function to generate AI guesses and evaluate alignment with human players.
-    
-    This method calculates embeddings for each word and the hint, computes cosine similarity 
-    between the hint embedding and word embeddings, then selects the word with the highest 
-    normalized similarity score as the AI guess. Finally, it evaluates if the AI guess 
-    corresponds to the player's guess.
-    
+
+    This method preloads embeddings for all unique words/hints, then uses parallel processing
+    to calculate embeddings similarities and evaluate alignment with human players.
+
     Args:
         batch_size (int): Number of rows to process before saving intermediate results
         max_rows (int): Maximum number of rows to process from the dataset
         resume_from_batch (int, optional): Batch number to resume from (None to start fresh)
-        
+        max_workers (int, optional): Maximum number of worker processes (defaults to CPU count)
+
     Returns:
         pandas.DataFrame: DataFrame containing all evaluation results with alignment metrics
     """
     # Load data and setup output paths
     df, base_output_path, final_output_path = load_and_setup_data()
-    
+
+    # Preload all embeddings first
+    preload_all_embeddings(df, max_rows, batch_size=100)
+
+    # Set up parallel processing
+    if max_workers is None:
+        max_workers = min(multiprocessing.cpu_count(), 4)  # Limit to 4 to respect API limits
+
     all_results = []
     batch_results = []
-    
+
     # Calculate starting point for resuming
     start_row = 0
     if resume_from_batch:
         start_row = (resume_from_batch - 1) * batch_size
         print(f"Resuming from batch {resume_from_batch}, starting at row {start_row}")
-    
-    # Process data in batches
+
+    # Prepare data for parallel processing
     total_rows = min(len(df), max_rows)
+    rows_to_process = df.iloc[start_row:max_rows]
+
+    print(f"Processing rows {start_row} to {total_rows} using {max_workers} workers")
+
+    # Process rows in parallel batches
     processed_rows = start_row
-    
-    print(f"Processing rows {start_row} to {total_rows} in batches of {batch_size}")
-    
-    for index, row in df.iloc[start_row:max_rows].iterrows():
-        # Extract data from current row
-        remaining = ast.literal_eval(row['remaining'])
-        hint = row['hint']
-        player_guess = row['output']
-        
-        print(f"Remaining: {remaining}")
-        print(f"Hint: {hint}")
-        print(f"Player guess: {player_guess}")
-        
-        # Calculate embeddings for hint and remaining words
-        hint_embedding, remaining_embeddings = calculate_embeddings(hint, remaining)
-        
-        # Compute cosine similarities between hint and each word
-        target_scores = compute_cosine_similarities(hint_embedding, remaining_embeddings)
-        
-        # Normalize scores relative to other scores for this hint
-        normalized_scores = normalize_scores(target_scores)
-        
-        # Predict AI's best guess
-        ai_guess, max_score = predict_ai_guess(remaining, normalized_scores)
-        
-        # Evaluate alignment between AI and human guess
-        alignment = evaluate_alignment(ai_guess, player_guess)
-        
-        # Create comprehensive result object
-        result_obj = create_result_object(
-            hint, remaining, player_guess, ai_guess, 
-            target_scores, normalized_scores, alignment
-        )
-        
-        batch_results.append(result_obj)
-        all_results.append(result_obj)
-        processed_rows += 1
-        
-        # Save batch when batch_size is reached
-        if len(batch_results) >= batch_size:
-            batch_num = processed_rows // batch_size
-            save_batch_results(batch_results, batch_num, base_output_path)
-            batch_results = []  # Reset batch
-        
-        # Progress update
-        if processed_rows % 10 == 0:
-            print(f"Progress: {processed_rows}/{total_rows} rows processed")
-    
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_index = {}
+        for index, row in rows_to_process.iterrows():
+            row_data = {
+                'remaining': ast.literal_eval(row['remaining']),
+                'hint': row['hint'],
+                'player_guess': row['output']
+            }
+            future = executor.submit(process_single_row, row_data)
+            future_to_index[future] = index
+
+        # Collect results as they complete
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            try:
+                result_obj = future.result()
+                batch_results.append(result_obj)
+                all_results.append(result_obj)
+                processed_rows += 1
+
+                # Save batch when batch_size is reached
+                if len(batch_results) >= batch_size:
+                    batch_num = processed_rows // batch_size
+                    save_batch_results(batch_results, batch_num, base_output_path)
+                    batch_results = []  # Reset batch
+
+                # Progress update
+                if processed_rows % 10 == 0:
+                    print(f"Progress: {processed_rows}/{total_rows} rows processed")
+
+            except Exception as exc:
+                print(f'Row {index} generated an exception: {exc}')
+                raise
+
     # Save any remaining results in the final batch
     if batch_results:
         batch_num = (processed_rows - 1) // batch_size + 1
         save_batch_results(batch_results, batch_num, base_output_path)
-    
+
     # Create final consolidated file and return results
     return save_final_results(all_results, final_output_path)
 
 
+
+
+
 if __name__ == "__main__":
     # You can adjust batch_size and max_rows as needed
-    generate_guess_and_evaluate(batch_size=50, max_rows=1000)
+    generate_guess_experiment(batch_size=50, max_rows=1000)
