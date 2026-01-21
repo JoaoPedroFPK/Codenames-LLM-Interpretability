@@ -37,5 +37,6 @@ def get_embedding(text):
     response = client.embeddings.create(input=text_key, model="text-embedding-3-small")
     embedding = response.data[0].embedding
     embeddings[text_key] = embedding
+    print(f"Computed embedding for {text}")
     save_embeddings(embeddings)
     return embedding

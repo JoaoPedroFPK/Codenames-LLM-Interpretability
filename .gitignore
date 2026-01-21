@@ -4,4 +4,6 @@ venv/
 .env
 utils/embeddings.json
 utils/players.json
-
+data/experiments/
+*__pycache__*
+*.md
