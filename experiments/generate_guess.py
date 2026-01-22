@@ -14,9 +14,13 @@ from typing import Dict, List, Any, Optional
 import multiprocessing
 
 
-def load_and_setup_data():
+def load_and_setup_data(use_player_context=False, alpha=0.3):
     """
     Load the preprocessed generate_guess data and setup output directory structure.
+
+    Args:
+        use_player_context (bool): Whether player context is being used
+        alpha (float): Alpha value for score fusion (only relevant if use_player_context=True)
 
     Returns:
         tuple: (DataFrame, str, str) containing the loaded data, base output path, and final output path
@@ -26,7 +30,13 @@ def load_and_setup_data():
     # Setup output directory and base filename
     os.makedirs('data/experiments', exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    base_output_path = f'data/experiments/generate_guess_evaluation_{timestamp}'
+    
+    # Include player context info in filename
+    if use_player_context:
+        base_output_path = f'data/experiments/generate_guess_evaluation_player_context_alpha{alpha}_{timestamp}'
+    else:
+        base_output_path = f'data/experiments/generate_guess_evaluation_{timestamp}'
+    
     final_output_path = f'{base_output_path}.csv'
 
     return df, base_output_path, final_output_path
@@ -294,13 +304,15 @@ def save_batch_results(results, batch_num, base_output_path):
     return batch_output_path
 
 
-def save_final_results(all_results, output_path):
+def save_final_results(all_results, output_path, batch_files=None):
     """
     Save all consolidated results to a final CSV file and print summary statistics.
+    Optionally removes batch files after successful save.
     
     Args:
         all_results (list): List of all result dictionaries
         output_path (str): Path for the final output file
+        batch_files (list, optional): List of batch file paths to remove after saving
         
     Returns:
         pandas.DataFrame: DataFrame containing all results
@@ -317,6 +329,18 @@ def save_final_results(all_results, output_path):
     print(f"Final results saved to: {output_path}")
     print(f"Alignment rate: {results_df['is_aligned'].mean():.2%}")
     
+    # Remove batch files after successful save
+    if batch_files:
+        print(f"\nCleaning up {len(batch_files)} batch file(s)...")
+        for batch_file in batch_files:
+            try:
+                if os.path.exists(batch_file):
+                    os.remove(batch_file)
+                    print(f"Removed: {batch_file}")
+            except Exception as e:
+                print(f"Warning: Could not remove {batch_file}: {e}")
+        print("Batch cleanup complete.")
+    
     return results_df
 
 def extract_player_features(df, prefix: str) -> dict:
@@ -332,7 +356,16 @@ def extract_player_features(df, prefix: str) -> dict:
                       The dictionary keys are feature names (e.g., "age", "care"), and values are the corresponding values from the DataFrame.
     """
     PLAYER_FEATURES = [
+        "marriage",
+        "education",
+        "race",
+        "continent",
+        "language",
+        "religion",
         "age",
+        "gender",
+        "country",
+        "native",
         "care",
         "fairness",
         "loyalty",
@@ -370,7 +403,7 @@ def generate_guess_experiment(batch_size=50, max_rows=1000, resume_from_batch=No
         pandas.DataFrame: DataFrame containing all evaluation results with alignment metrics
     """
     # Load data and setup output paths
-    df, base_output_path, final_output_path = load_and_setup_data()
+    df, base_output_path, final_output_path = load_and_setup_data(use_player_context, alpha)
 
     # Preload all embeddings first
     preload_all_embeddings(df, max_rows, batch_size=100)
@@ -388,6 +421,7 @@ def generate_guess_experiment(batch_size=50, max_rows=1000, resume_from_batch=No
 
     all_results = []
     batch_results = []
+    batch_files = []  # Track batch file paths for cleanup
 
     # Calculate starting point for resuming
     start_row = 0
@@ -437,7 +471,8 @@ def generate_guess_experiment(batch_size=50, max_rows=1000, resume_from_batch=No
                 # Save batch when batch_size is reached
                 if len(batch_results) >= batch_size:
                     batch_num = processed_rows // batch_size
-                    save_batch_results(batch_results, batch_num, base_output_path)
+                    batch_file = save_batch_results(batch_results, batch_num, base_output_path)
+                    batch_files.append(batch_file)  # Track for cleanup
                     batch_results = []  # Reset batch
 
                 # Progress update
@@ -451,10 +486,11 @@ def generate_guess_experiment(batch_size=50, max_rows=1000, resume_from_batch=No
     # Save any remaining results in the final batch
     if batch_results:
         batch_num = (processed_rows - 1) // batch_size + 1
-        save_batch_results(batch_results, batch_num, base_output_path)
+        batch_file = save_batch_results(batch_results, batch_num, base_output_path)
+        batch_files.append(batch_file)  # Track for cleanup
 
-    # Create final consolidated file and return results
-    return save_final_results(all_results, final_output_path)
+    # Create final consolidated file and return results (will cleanup batch files)
+    return save_final_results(all_results, final_output_path, batch_files)
 
 
 
@@ -463,4 +499,4 @@ def generate_guess_experiment(batch_size=50, max_rows=1000, resume_from_batch=No
 if __name__ == "__main__":
     # You can adjust batch_size and max_rows as needed
     # Set use_player_context=True to include player personality in scoring
-    generate_guess_experiment(batch_size=50, max_rows=1000, use_player_context=False, alpha=0.3)
+    generate_guess_experiment(batch_size=50, max_rows=1000, use_player_context=False, alpha=0.1)

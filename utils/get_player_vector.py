@@ -100,6 +100,7 @@ def get_player_vector(player_features: Dict) -> List[float]:
     To compute the vector, we rely on extensive information provided about the player,
     including demographics, personality, political leaning, and more.
     """
+    print(f"Getting player vector for features: {player_features}")
     player_key = _player_features_to_string(player_features)
     players = load_players()
     if player_key in players:
@@ -125,6 +126,7 @@ def get_player_vectors_batch(player_features_list: List[Dict], batch_size: int =
     uncached_features = []
     uncached_keys = []
     for features in player_features_list:
+        print(f"Getting player vector for features: {features}")
         player_key = _player_features_to_string(features)
         if player_key in players:
             results[player_key] = players[player_key]
